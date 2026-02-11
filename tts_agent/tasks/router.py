@@ -19,6 +19,8 @@ class SegmentRouter:
         return event.authenticated or event.authenticated_user is not None
 
     def is_actionable(self, event: SegmentEvent) -> bool:
+        if bool(event.actionability.get('is_actionable')):
+            return True
         text = (event.transcript_final or '').strip().lower()
         if not text:
             return False

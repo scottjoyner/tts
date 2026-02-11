@@ -18,8 +18,24 @@ class TTSPipeline:
         else:
             self.engine = DummyTTSEngine()
 
-    async def synthesize_stream(self, text: str) -> AsyncIterator[tuple[str, bytes]]:
+    async def synthesize_stream(self, text: str, voice_profile: str | None = None) -> AsyncIterator[tuple[str, bytes]]:
+        if hasattr(self.engine, 'synthesize_stream'):
+            chunks = chunk_text(text, self.settings.tts_chunk_sentences)
+            for chunk in chunks:
+                async for audio in self.engine.synthesize_stream(
+                    chunk,
+                    sample_rate=self.settings.tts_sample_rate,
+                    voice_profile=voice_profile,
+                ):
+                    self.audio_output.play(audio)
+                    yield chunk, audio
+            return
+
         for chunk in chunk_text(text, self.settings.tts_chunk_sentences):
-            audio = await self.engine.synthesize(chunk, sample_rate=self.settings.tts_sample_rate)
+            audio = await self.engine.synthesize(
+                chunk,
+                sample_rate=self.settings.tts_sample_rate,
+                voice_profile=voice_profile,
+            )
             self.audio_output.play(audio)
             yield chunk, audio

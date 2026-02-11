@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     ralph_model_routing_path: Path = Path('routing.json')
     ralph_progress_speech: bool = True
 
+    task_parallelism: int = 2
+    conversation_memory_turns: int = 10
+    conversation_summary_every: int = 4
+
     tts_engine: Literal['qwen3', 'dummy'] = 'dummy'
     tts_voice_profile_dir: Path = Path('data/voices')
     tts_default_voice: str = 'primary_user'
