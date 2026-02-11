@@ -4,24 +4,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from voicebus.schema.events import VoiceBusEvent
+
 
 TaskStatus = Literal['queued', 'running', 'awaiting_user', 'done', 'failed', 'cancelled']
 
 
-class SegmentEvent(BaseModel):
-    event_type: str
-    event_id: str | None = None
+class SegmentEvent(VoiceBusEvent):
     segment_id: str | None = None
-    transcript_final: str | None = None
-    transcript_partial: str | None = None
-    triggered: bool = False
-    is_command: bool = False
-    authenticated: bool = False
-    authenticated_user: str | None = None
-    speaker_candidate: str | None = None
-    speaker_score: float | None = None
-    actionability: dict[str, Any] = Field(default_factory=dict)
-    conversation_id: str | None = None
     start_ts: float | None = None
     end_ts: float | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
@@ -32,6 +22,8 @@ class TaskCreate(BaseModel):
     speaker_user: str
     text: str
     conversation_id: str | None = None
+    turn_id: str | None = None
+    priority: Literal['critical', 'interactive', 'background'] = 'interactive'
 
 
 class TaskRecord(BaseModel):
@@ -42,4 +34,8 @@ class TaskRecord(BaseModel):
     text: str
     status: TaskStatus
     conversation_id: str | None = None
+    turn_id: str | None = None
+    priority: str = 'interactive'
+    task_signature: str | None = None
+    attempts: int = 0
     result_summary: str | None = None
