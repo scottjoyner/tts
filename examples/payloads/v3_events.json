@@ -1,0 +1,60 @@
+{
+  "turn_final": {
+    "schema_version": "3.0",
+    "event_type": "turn_final",
+    "conversation_id": "conv-001",
+    "turn_id": "turn-009",
+    "transcript_final": "Ralph, please fix the failing test in parser.py",
+    "speaker": {
+      "authenticated": true,
+      "authenticated_user": "alice",
+      "candidate": "alice",
+      "score": 0.97
+    },
+    "trigger_context": {
+      "triggered": true,
+      "phrase": "ralph"
+    },
+    "actionability": {
+      "actionable": true,
+      "confidence": 0.96,
+      "reason": "authenticated+trigger_or_classifier"
+    }
+  },
+  "task_created": {
+    "schema_version": "3.0",
+    "event_type": "task_created",
+    "conversation_id": "conv-001",
+    "turn_id": "turn-009",
+    "task_id": "task-123",
+    "payload": {
+      "priority": "interactive",
+      "task_signature": "sha256:abcd"
+    }
+  },
+  "agent_step_result": {
+    "schema_version": "3.0",
+    "event_type": "agent_step_result",
+    "conversation_id": "conv-001",
+    "task_id": "task-123",
+    "run_id": "run-777",
+    "step_id": "step-4",
+    "payload": {
+      "agent": "verifier",
+      "status": "passed",
+      "details": "pytest -q: 32 passed"
+    }
+  },
+  "tts_chunk": {
+    "schema_version": "3.0",
+    "event_type": "tts_chunk",
+    "conversation_id": "conv-001",
+    "task_id": "task-123",
+    "payload": {
+      "chunk_index": 3,
+      "sample_rate": 24000,
+      "text": "Done. I fixed the parser and all tests pass.",
+      "voice": "alice"
+    }
+  }
+}
