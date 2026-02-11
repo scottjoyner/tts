@@ -6,17 +6,25 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket
 
+from tts_agent.api.routes_tasks import build_tasks_router
 from tts_agent.config import Settings, settings
 from tts_agent.events.ws_broadcast import WSConnectionHub
+from tts_agent.ingest.checkpoint_store import IngestCheckpointStore
 from tts_agent.ingest.jsonl_tailer import JSONLTailer
 from tts_agent.ingest.stt_ws_client import STTWebSocketIngest
+from tts_agent.llm.router import StageModelRouter
+from tts_agent.memory.conversation_store import ConversationStore
+from tts_agent.memory.summarizer import ConversationSummarizer
 from tts_agent.ralph.executor import RalphExecutor
 from tts_agent.storage.jsonl_writer import JSONLWriter
+from tts_agent.tasks.cancel import ActiveTaskRegistry, is_cancel_intent, is_urgent_barge_in
 from tts_agent.tasks.models import SegmentEvent, TaskCreate
 from tts_agent.tasks.queue import TaskQueue
 from tts_agent.tasks.router import SegmentRouter
 from tts_agent.tasks.store_sqlite import TaskStore
 from tts_agent.tts.pipeline import TTSPipeline
+from tts_agent.tts.playback import InterruptiblePlayback
+from tts_agent.tts.priority_queue import AudioPriorityQueue
 
 
 class AppContext:
@@ -25,13 +33,41 @@ class AppContext:
         self.store = TaskStore(cfg.task_db_path)
         self.queue = TaskQueue()
         self.router = SegmentRouter(cfg)
-        self.ralph = RalphExecutor(self.store, cfg.ralph_max_iters, cfg.ralph_max_seconds)
+        self.model_router = StageModelRouter(cfg.ralph_model_routing_path)
+        self.memory = ConversationStore(cfg.task_db_path, max_turns=cfg.conversation_memory_turns)
+        self.summarizer = ConversationSummarizer(self.memory, every_n_turns=cfg.conversation_summary_every)
+        self.ralph = RalphExecutor(
+            self.store,
+            cfg.ralph_max_iters,
+            cfg.ralph_max_seconds,
+            model_router=self.model_router,
+            context_provider=self.memory,
+        )
         self.tts = TTSPipeline(cfg)
         self.event_log = JSONLWriter(cfg.events_jsonl_path)
         self.event_hub = WSConnectionHub()
         self.audio_hub = WSConnectionHub()
         self.worker_task: asyncio.Task | None = None
         self.ingest_tasks: list[asyncio.Task] = []
+        self.checkpoints = IngestCheckpointStore(cfg.task_db_path)
+        self.running: list[asyncio.Task] = []
+        self.active = ActiveTaskRegistry()
+        self.audio_queue = AudioPriorityQueue()
+        self.playback = InterruptiblePlayback(self.audio_queue, self._broadcast_audio)
+        self.playback_task: asyncio.Task | None = None
+        self._task_semaphore = asyncio.Semaphore(cfg.task_parallelism)
+
+    async def _broadcast_audio(self, payload: dict, audio: bytes) -> None:
+        await self.audio_hub.broadcast_json(payload)
+        if audio:
+            await self.audio_hub.broadcast_bytes(audio)
+
+    def _conversation_id(self, event: SegmentEvent) -> str:
+        if event.conversation_id:
+            return event.conversation_id
+        bucket = int((event.end_ts or event.start_ts or 0) // 30)
+        speaker = event.authenticated_user or event.speaker_candidate or 'anon'
+        return f'{speaker}-{bucket}'
 
     async def process_event(self, payload: dict) -> None:
         event = SegmentEvent(**payload)
@@ -40,35 +76,45 @@ class AppContext:
 
         if event.event_type != 'segment_final':
             return
+        if not self.router.is_authenticated(event):
+            return
+
+        text = (event.transcript_final or '').strip()
+        if is_cancel_intent(text):
+            active = self.store.get_active_task()
+            if active:
+                self.store.cancel_task(active.task_id, reason='voice_cancel')
+                self.playback.interrupt()
+                await self.event_hub.broadcast_json({'event_type': 'task_cancelled', 'task_id': active.task_id})
+            return
 
         if not self.router.is_actionable(event):
             return
 
-        if not self.router.is_authenticated(event):
-            return
+        if self.playback.active_task and is_urgent_barge_in(text):
+            self.playback.interrupt()
 
+        conversation_id = self._conversation_id(event)
+        self.memory.append_turn(conversation_id, 'user', text)
+        self.summarizer.maybe_rollup(conversation_id)
         task = self.store.create_task(
             TaskCreate(
                 source_segment_id=event.segment_id or 'unknown',
                 speaker_user=event.authenticated_user or event.speaker_candidate or self.cfg.tts_default_voice,
-                text=event.transcript_final or '',
+                text=text,
+                conversation_id=conversation_id,
             )
         )
         await self.event_hub.broadcast_json({'event_type': 'task_created', 'task': task.model_dump()})
         await self.queue.put(task)
 
-    async def worker(self) -> None:
-        while True:
-            task = await self.queue.get()
-            if self.cfg.ralph_progress_speech:
-                async for chunk, audio in self.tts.synthesize_stream('Working on it.'):
-                    await self.audio_hub.broadcast_json({'text': chunk, 'bytes': len(audio), 'task_id': task.task_id})
-                    await self.audio_hub.broadcast_bytes(audio)
+    async def _run_single_task(self, task):
+        async with self._task_semaphore:
+            self.active.mark_running(task.task_id)
             result = await self.ralph.run_task(task)
-            async for chunk, audio in self.tts.synthesize_stream(result.summary):
-                self.store.record_tts_output(task.task_id, chunk)
-                await self.audio_hub.broadcast_json({'text': chunk, 'bytes': len(audio), 'task_id': task.task_id})
-                await self.audio_hub.broadcast_bytes(audio)
+            if self.store.get_task(task.task_id).status != 'cancelled':
+                self.memory.append_turn(task.conversation_id or task.task_id, 'assistant', result.summary)
+                await self.audio_queue.put(task.task_id, result.summary, priority='task_response')
             await self.event_hub.broadcast_json(
                 {
                     'event_type': 'task_completed',
@@ -77,6 +123,15 @@ class AppContext:
                     'summary': result.summary,
                 }
             )
+            self.active.mark_done(task.task_id)
+
+    async def worker(self) -> None:
+        while True:
+            task = await self.queue.get()
+            if self.cfg.ralph_progress_speech:
+                await self.audio_queue.put(task.task_id, 'Working on it.', priority='backchannel')
+            run_task = asyncio.create_task(self._run_single_task(task))
+            self.running.append(run_task)
 
 
 def create_app(cfg: Settings = settings) -> FastAPI:
@@ -85,19 +140,23 @@ def create_app(cfg: Settings = settings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         app_context.worker_task = asyncio.create_task(app_context.worker())
+        app_context.playback_task = asyncio.create_task(app_context.playback.run(app_context.tts.synthesize_stream))
         if cfg.stt_ingest_mode in {'ws', 'both'}:
-            ws_ingest = STTWebSocketIngest(cfg.stt_ws_url, app_context.process_event)
+            ws_ingest = STTWebSocketIngest(cfg.stt_ws_url, app_context.process_event, checkpoints=app_context.checkpoints)
             app_context.ingest_tasks.append(asyncio.create_task(ws_ingest.run()))
         if cfg.stt_ingest_mode in {'tail', 'both'}:
-            tailer = JSONLTailer(cfg.stt_jsonl_dir, app_context.process_event)
+            tailer = JSONLTailer(cfg.stt_jsonl_dir, app_context.process_event, checkpoints=app_context.checkpoints)
             app_context.ingest_tasks.append(asyncio.create_task(tailer.run()))
         yield
-        for task in app_context.ingest_tasks:
+        for task in app_context.ingest_tasks + app_context.running:
             task.cancel()
         if app_context.worker_task:
             app_context.worker_task.cancel()
+        if app_context.playback_task:
+            app_context.playback_task.cancel()
 
     app = FastAPI(title='TTS Agent Orchestrator', lifespan=lifespan)
+    app.include_router(build_tasks_router(app_context.store))
 
     @app.get('/health')
     async def health() -> dict[str, str]:
@@ -107,7 +166,17 @@ def create_app(cfg: Settings = settings) -> FastAPI:
     async def stats() -> dict:
         data = app_context.store.stats()
         data['queue_depth'] = app_context.queue.qsize()
+        data['model_health'] = app_context.model_router.snapshot()
+        data['tts_ttfb_ms'] = app_context.playback.avg_ttfb_ms()
+        data['audio_queue_depth'] = app_context.audio_queue.qsize()
         return data
+
+    @app.get('/trace/{task_id}')
+    async def trace(task_id: str) -> dict:
+        task = app_context.store.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail='Task not found')
+        return app_context.store.task_trace(task_id)
 
     @app.get('/tasks')
     async def list_tasks() -> list[dict]:
@@ -127,6 +196,7 @@ def create_app(cfg: Settings = settings) -> FastAPI:
                 source_segment_id=payload.get('source_segment_id', 'manual'),
                 speaker_user=payload.get('speaker_user', cfg.tts_default_voice),
                 text=payload['text'],
+                conversation_id=payload.get('conversation_id', 'manual-conversation'),
             )
         )
         await app_context.queue.put(task)

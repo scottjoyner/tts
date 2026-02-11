@@ -1,139 +1,138 @@
-# TTSBench + TTS Agent Orchestrator
+# TTSBench + TTS Agent Orchestrator (v2)
 
-This repository now contains two local-first components:
+This repository contains:
 
-1. `ttsbench`: TTS benchmarking/training utilities.
-2. `tts_agent`: a realtime **Agent + TTS Orchestrator** that consumes STT events, gates on speaker authentication, runs a RALPH-style loop, and synthesizes speech responses.
+1. `ttsbench`: benchmarking/training utilities.
+2. `tts_agent`: local-first realtime STT→task→RALPH→TTS orchestrator with replay-safe ingest, bounded conversation memory, and interruptible speech.
 
-## Repo Tree (Orchestrator)
+## v2 Orchestrator Tree (new/updated)
 
 ```text
 tts_agent/
-  main.py
-  server.py
-  config.py
+  api/
+    routes_tasks.py                # cancel endpoints
   ingest/
-    stt_ws_client.py
-    jsonl_tailer.py
-    normalizer.py
-  tasks/
-    models.py
-    store_sqlite.py
-    queue.py
-    router.py
+    checkpoint_store.py            # event_id + hash dedupe + offset checkpoints
+    replay_client.py               # replay cursor + JSONL offset reader
+    stt_ws_client.py               # reconnect/resubscribe + replay cursor + dedupe
+    jsonl_tailer.py                # offset checkpoint replay from disk
+  memory/
+    conversation_store.py          # raw transcript + summary tables
+    summarizer.py                  # rolling summary every N turns
   ralph/
-    executor.py
-    planner.py
-    evaluator.py
-    router.py
-    prompts.py
+    context_builder.py             # bounded context construction
+    iteration.py                   # IterationResult schema
+    completion.py                  # done-when rule checks
+    scoring.py                     # judge/heuristic confidence score
+    executor.py                    # structured loop + safety valves + fallback
   llm/
-    openai_compat_client.py
-    providers.py
+    router.py                      # per-stage routing + health + fallback chain
+  tasks/
+    state_machine.py               # lifecycle transitions
+    cancel.py                      # cancel/barge-in intents + active registry
+    models.py                      # extended task + segment fields
+    store_sqlite.py                # persisted lifecycle/trace/artifacts helpers
   tts/
-    pipeline.py
-    chunker.py
-    audio_output.py
+    priority_queue.py              # system_critical > task_response > backchannel
+    playback.py                    # interruptible foreground playback
+    pipeline.py                    # chunk/stream + voice profile plumbing
     engines/
-      qwen3_tts_engine.py
-      dummy_engine.py
-    voice_profiles.py
-  events/
-    bus.py
-    ws_broadcast.py
-  storage/
-    jsonl_writer.py
-    artifact_store.py
-  utils/
-    logging.py
-    time.py
-    retry.py
+      qwen3_tts_engine.py          # voice_profile + synthesize_stream contract
 ```
 
-## Quickstart
+## Run against STT upstream
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp .env.example .env
 ```
 
-Run API + orchestrator worker:
+Run orchestrator:
 
 ```bash
 tts-agent run
 ```
 
-Connect to STT websocket by setting:
+Example env:
 
 ```bash
 export STT_WS_URL=ws://127.0.0.1:8000/ws/events
-export STT_INGEST_MODE=ws
+export STT_INGEST_MODE=ws              # ws|tail|both
+export TASK_DB_PATH=data/tasks.db
+export TTS_ENGINE=dummy                # qwen3|dummy
 ```
 
-Or use JSONL tailing mode:
+## Replay + dedupe behavior
 
-```bash
-export STT_INGEST_MODE=tail
-export STT_JSONL_DIR=/path/to/stt/data
+- `ingest_checkpoints` table stores per-source `last_event_id` and JSONL byte offsets.
+- `ingest_dedupe` table stores SHA-256 event hash; duplicate payloads are skipped.
+- WebSocket ingest re-subscribes with `?cursor=<last_event_id>` when available.
+- JSONL ingest resumes from last persisted byte offset.
+
+## Voice profile enrollment/mapping
+
+- Set speaker identity in upstream auth (`authenticated_user`) or pass `speaker_user` on manual `POST /tasks`.
+- The TTS pipeline forwards `voice_profile` through engine APIs.
+- `Qwen3TTSEngine` exposes:
+  - `synthesize(text, sample_rate, voice_profile)`
+  - `synthesize_stream(text, sample_rate, voice_profile)`
+
+## Cancellation + barge-in test flow
+
+1. Start a long task (voice or `POST /tasks`).
+2. Speak authenticated cancel intent: “stop”, “cancel”, “nevermind”.
+3. Active task transitions to `cancelled`; playback interrupts immediately.
+4. During playback, urgent authenticated phrase (“stop”, “wait”, “new request”) triggers barge-in interrupt.
+
+## Main APIs
+
+- `POST /tasks/{id}/cancel`
+- `POST /tasks/cancel-active`
+- `GET /trace/{task_id}`
+- `GET /stats` (queue depth, avg duration, model health, TTS TTFB)
+- `WS /ws/events` (task lifecycle, iterations, routing decisions)
+- `WS /ws/audio` (audio chunk + interruption events)
+
+## Event payload examples
+
+### Task creation from authenticated transcript
+
+```json
+{
+  "event_type": "task_created",
+  "task": {
+    "task_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "source_segment_id": "seg-192",
+    "speaker_user": "primary_user",
+    "conversation_id": "primary_user-44",
+    "status": "queued",
+    "text": "Summarize my latest meeting notes"
+  }
+}
 ```
 
-## Behavior Summary
+### RALPH iteration event
 
-- Observes all `segment_final` events and logs them to JSONL.
-- Only authenticated + actionable requests enter task execution.
-- Authenticated requests become persistent tasks in SQLite (`tasks`, `task_events`, `llm_calls`, `tts_outputs`).
-- RALPH executor loops until completion/limits.
-- TTS pipeline chunks text and streams audio on `/ws/audio`.
-
-## API Endpoints
-
-- `GET /health`
-- `GET /stats`
-- `GET /tasks`
-- `GET /tasks/{task_id}`
-- `POST /tasks`
-- `WS /ws/events`
-- `WS /ws/audio`
-
-## qwen3-tts Integration Contract
-
-The wrapper is `tts_agent/tts/engines/qwen3_tts_engine.py`.
-
-Expected contract for your benchmark repo adapter:
-
-- Input: `(text: str, sample_rate: int, voice_profile_path: Optional[path])`
-- Output: `bytes` containing streaming PCM16 audio chunks (or single chunk for v1).
-- Non-blocking API: `async def synthesize(...) -> bytes`.
-
-Where to place model files:
-
-- Put checkpoints under your local model path, e.g. `models/qwen3-tts/`.
-- Pass path through env/config and initialize `Qwen3TTSEngine(model_path=...)`.
-
-Validation command (manual):
-
-```bash
-python - <<'PY'
-import asyncio
-from tts_agent.tts.engines.qwen3_tts_engine import Qwen3TTSEngine
-
-async def main():
-    engine = Qwen3TTSEngine()
-    audio = await engine.synthesize('Hello from qwen3-tts adapter', sample_rate=24000)
-    print('bytes=', len(audio))
-
-asyncio.run(main())
-PY
+```json
+{
+  "event_type": "ralph_iteration",
+  "iteration": 2,
+  "plan": ["gather context", "draft summary", "verify done"],
+  "next_action": "draft summary",
+  "completion_check": {"done": false, "reason": "needs_more_work"},
+  "confidence": 0.67
+}
 ```
 
-## Troubleshooting Latency
+### Audio chunk event
 
-- Lower `TTS_CHUNK_SENTENCES` to `1` for faster first audio.
-- Use lower-latency planning model in `routing.json`.
-- Disable local playback if headless (`TTS_PLAY_LOCAL=0`).
-
-## Existing TTSBench Commands
-
-`ttsbench` commands are still available for benchmarking/training workflows.
+```json
+{
+  "event_type": "tts_chunk",
+  "task_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "priority": "task_response",
+  "text": "Here is the summary so far.",
+  "bytes": 8192
+}
+```
