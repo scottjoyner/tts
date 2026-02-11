@@ -1,0 +1,24 @@
+{
+  "routes": [
+    {
+      "name": "planner-fast",
+      "provider": "openai_compat",
+      "base_url": "http://127.0.0.1:1234",
+      "model": "qwen2.5-7b-instruct",
+      "max_context": 8192,
+      "use_cases": ["planning", "summarizing"],
+      "latency_weight": 0.8,
+      "quality_weight": 0.7
+    },
+    {
+      "name": "reasoner-quality",
+      "provider": "openai_compat",
+      "base_url": "http://127.0.0.1:1234",
+      "model": "qwen2.5-14b-instruct",
+      "max_context": 16384,
+      "use_cases": ["coding", "analysis", "planning"],
+      "latency_weight": 1.4,
+      "quality_weight": 0.95
+    }
+  ]
+}
