@@ -1,0 +1,37 @@
+name: hermes-voice-overlay
+
+services:
+  hermes-voice-overlay:
+    build: .
+    image: hermes-agent:voice-overlay-prod
+    container_name: hermes-voice-overlay
+    restart: unless-stopped
+    command:
+      - hermes-voice-overlay
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9720"
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      HERMES_HOME: /opt/data
+      HERMES_PLANNER_PROVIDER: ${HERMES_PLANNER_PROVIDER:-lmstudio}
+      HERMES_PLANNER_BASE_URL: ${HERMES_PLANNER_BASE_URL:-http://host.docker.internal:1234}
+      HERMES_PLANNER_MODEL: ${HERMES_PLANNER_MODEL:-local-model}
+      HERMES_PLANNER_TIMEOUT_SECONDS: ${HERMES_PLANNER_TIMEOUT_SECONDS:-20}
+    volumes:
+      - hermes-data:/opt/data
+    ports:
+      - "127.0.0.1:${HERMES_VOICE_PORT:-9720}:9720"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9720/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  hermes-data:
